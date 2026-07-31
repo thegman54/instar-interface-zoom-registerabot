@@ -1,0 +1,27 @@
+name: zoom_registerabot
+display_name: Zoom (via RegisterABot)
+description: Thin Zoom adapter — receives Zoom Team Chat messages + files over Zoom's outbound event WebSocket and pipes them to the bot over the RegisterABot relay as a service client. No gatekeeper contact.
+type: interface
+category: Interfaces
+icon: zoom
+version: 0.1.0
+
+credentials:
+  - key: ZOOM_CLIENT_ID
+    description: Zoom Server-to-Server OAuth client id
+  - key: ZOOM_CLIENT_SECRET
+    description: Zoom Server-to-Server OAuth client secret
+  - key: ZOOM_BOT_JID
+    description: The Zoom chatbot JID (sender identity for replies; also filters our own echoes)
+  - key: ZOOM_WS_SUBSCRIPTION_ID
+    description: Zoom WebSocket subscription id (optional, if the app requires one)
+  - key: ZOOM_VERIFICATION_TOKEN
+    description: Zoom verification token — used to answer endpoint.url_validation challenges
+  - key: REGISTERABOT_RELAY_URL
+    description: RegisterABot relay base URL (wss://…)
+  - key: ZOOM_REGISTERABOT_TOKEN
+    description: This adapter's RegisterABot service API key (its relay identity)
+  - key: REGISTERABOT_BOT_SLUG
+    description: Target bot slug on the relay
+  - key: REGISTERABOT_SERVICE_SLUG
+    description: This adapter's service slug on the relay (default zoom-adapter)

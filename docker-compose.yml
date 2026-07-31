@@ -1,0 +1,19 @@
+# Zoom → RegisterABot thin adapter. Outbound-only (Zoom event WS + relay WS) — no ports.
+# Creds are injected from Infisical by the instar stack manager.
+services:
+  zoom-registerabot:
+    build: .
+    container_name: zoom-registerabot
+    restart: unless-stopped
+    environment:
+      # Zoom Server-to-Server OAuth (receive events, send replies, fetch files)
+      - ZOOM_CLIENT_ID=${ZOOM_CLIENT_ID}
+      - ZOOM_CLIENT_SECRET=${ZOOM_CLIENT_SECRET}
+      - ZOOM_BOT_JID=${ZOOM_BOT_JID}
+      - ZOOM_WS_SUBSCRIPTION_ID=${ZOOM_WS_SUBSCRIPTION_ID:-}
+      - ZOOM_VERIFICATION_TOKEN=${ZOOM_VERIFICATION_TOKEN:-}
+      # RegisterABot relay (this adapter's own identity)
+      - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL}
+      - REGISTERABOT_SERVICE_SLUG=${REGISTERABOT_SERVICE_SLUG:-zoom-adapter}
+      - ZOOM_REGISTERABOT_TOKEN=${ZOOM_REGISTERABOT_TOKEN}
+      - REGISTERABOT_BOT_SLUG=${REGISTERABOT_BOT_SLUG}
