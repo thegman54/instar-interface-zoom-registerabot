@@ -60,7 +60,11 @@ CHATBOT_API = "https://api.zoom.us/v2/im/chat/messages"
 # --- relay websocket state (one persistent service connection) ----------------
 _relay_ws = None
 _relay_loop: asyncio.AbstractEventLoop | None = None
-_pending: dict[str, asyncio.Future] = {}   # session_id -> future awaiting final_response
+# session_id -> {"to_jid", "account_id", "ts"} — where to post this turn's frames.
+# The relay routes EVERY bot→service frame (final_response, video, …) by session_id, so we
+# keep the reply destination around long enough to catch trailing frames.
+_sessions: dict[str, dict] = {}
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))
 
 # --- Zoom S2S token cache -----------------------------------------------------
 _zoom_token: str | None = None
@@ -104,14 +108,11 @@ async def _relay_client():
                         env = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if env.get("type") == "final_response":
-                        sid = env.get("session_id")
-                        fut = _pending.pop(sid, None)
-                        if fut and not fut.done():
-                            try:
-                                fut.set_result(json.loads(env.get("payload") or "{}"))
-                            except Exception:
-                                fut.set_result({})
+                    if env.get("session_id"):
+                        try:
+                            await _dispatch_frame(env)
+                        except Exception as e:
+                            log.warning("dispatch_error", error=str(e))
         except Exception as e:
             log.warning("relay_disconnected", error=str(e))
         finally:
@@ -119,11 +120,59 @@ async def _relay_client():
         await asyncio.sleep(5)  # reconnect
 
 
-async def _send_to_bot(text: str, user_id: str, attachments: list) -> dict | None:
-    """Send one chat_request over the relay and await the bot's final_response."""
+def _prune_sessions():
+    cutoff = time.time() - SESSION_TTL
+    for sid in [s for s, v in _sessions.items() if v.get("ts", 0) < cutoff]:
+        _sessions.pop(sid, None)
+
+
+async def _dispatch_frame(env: dict):
+    """A bot→service frame arrived on the relay. Route it to the mapped Zoom conversation."""
+    dest = _sessions.get(env.get("session_id"))
+    if not dest:
+        return
+    to_jid, account_id = dest["to_jid"], dest["account_id"]
+    ftype = env.get("type")
+    try:
+        payload = json.loads(env.get("payload") or "{}")
+    except Exception:
+        payload = {}
+
+    if ftype == "final_response":
+        reply = payload.get("reply") or ""
+        if reply:
+            await _send_zoom_reply(to_jid, account_id, reply)
+        # Outbound files + embedded voice audio the bot produced.
+        media = list(payload.get("attachments") or [])
+        if payload.get("audio", {}).get("base64"):
+            media.append({"name": "voice.mp3", "kind": "audio"})
+        if media:
+            await _deliver_media(to_jid, account_id, media)
+    elif ftype == "video":
+        await _deliver_media(to_jid, account_id, [{"name": "avatar.mp4", "kind": "video"}])
+    # 'audio' (duplicate of embedded) and 'idle' frames are intentionally ignored.
+
+
+async def _deliver_media(to_jid: str, account_id: str, media: list):
+    """Deliver the bot's outbound files/audio/video into Zoom.
+
+    Zoom's chatbot API (imchat:bot) sends message CARDS only — it cannot push binary files,
+    so real delivery is link-based: upload the bytes to R2/KV (the relay-side normalization
+    layer, see docs/INTERFACE_BUS.md) and send the short-lived link as a `link` card here.
+    Until that layer exists we DON'T silently drop — we tell the user media was produced.
+    Wire the R2 link here (one call) once the normalization layer ships."""
+    names = ", ".join(m.get("name", "file") for m in media)
+    log.info("zoom_media_pending_r2", items=names, count=len(media))
+    await _send_zoom_reply(
+        to_jid, account_id,
+        f"📎 Generated {len(media)} attachment(s) ({names}). Zoom chat delivery needs the "
+        f"hosted-link layer — coming with R2.")
+
+
+async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
+    """Send one chat_request over the relay. Replies arrive asynchronously as frames."""
     if _relay_ws is None:
-        return None
-    sid = str(uuid.uuid4())
+        return
     envelope = {
         "v": 1, "type": "chat_request", "session_id": sid,
         "timestamp": int(time.time() * 1000),
@@ -138,15 +187,10 @@ async def _send_to_bot(text: str, user_id: str, attachments: list) -> dict | Non
             "user_context": {"user_id": user_id},
         }),
     }
-    fut = _relay_loop.create_future()
-    _pending[sid] = fut
     try:
         await _relay_ws.send(json.dumps(envelope))
-        return await asyncio.wait_for(fut, timeout=REPLY_TIMEOUT)
     except Exception as e:
-        _pending.pop(sid, None)
         log.warning("send_to_bot_failed", error=str(e))
-        return None
 
 
 # --- Zoom file fetch (best-effort — validate against a real payload) ----------
@@ -249,10 +293,16 @@ async def _handle_event(raw: str, ws):
     if not text and not attachments:
         return
 
-    result = await _send_to_bot(text or "(file attached)", user_id, attachments)
-    reply = (result or {}).get("reply") if result else None
-    await _send_zoom_reply(to_jid, account_id,
-                           reply or "I couldn't reach the bot right now — try again in a moment.")
+    if _relay_ws is None:
+        await _send_zoom_reply(to_jid, account_id,
+                               "I couldn't reach the bot right now — try again in a moment.")
+        return
+
+    # Register where this turn's frames should land, then fire the request (non-blocking).
+    sid = str(uuid.uuid4())
+    _prune_sessions()
+    _sessions[sid] = {"to_jid": to_jid, "account_id": account_id, "ts": time.time()}
+    await _send_to_bot(sid, text or "(file attached)", user_id, attachments)
 
 
 async def _zoom_client():
