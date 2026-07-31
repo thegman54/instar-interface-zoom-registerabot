@@ -350,9 +350,12 @@ async def _heartbeat(ws):
 
 # --- multi-tenant control plane (instar connects/disconnects us per profile) --
 def _set_active_bot(bot: str | None):
-    """Point (or unpoint) the adapter at a bot slug (from the profile) and force the relay to
-    reconnect. Our service identity never changes — only which bot we route to."""
+    """Point (or unpoint) the adapter at a bot slug (from the profile). Only force a reconnect
+    when the bot actually CHANGES — the gatekeeper keepalive re-calls connect every cycle with
+    the same bot, and churning the socket each time would drop it for ~2s."""
     global _active_bot
+    if bot == _active_bot:
+        return  # no change — leave the live socket alone
     _active_bot = bot
     if _relay_loop and _relay_ws is not None:
         asyncio.run_coroutine_threadsafe(_relay_ws.close(), _relay_loop)
