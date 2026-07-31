@@ -142,31 +142,54 @@ async def _dispatch_frame(env: dict):
         reply = payload.get("reply") or ""
         if reply:
             await _send_zoom_reply(to_jid, account_id, reply)
-        # Outbound files + embedded voice audio the bot produced.
-        media = list(payload.get("attachments") or [])
-        if payload.get("audio", {}).get("base64"):
-            media.append({"name": "voice.mp3", "kind": "audio"})
-        if media:
-            await _deliver_media(to_jid, account_id, media)
+        # Outbound files + embedded voice audio → hosted links (the relay stored them).
+        items = [a for a in (payload.get("attachments") or []) if a.get("type") != "audio"]
+        if payload.get("audio"):
+            items.append({**payload["audio"], "name": "voice.mp3"})
+        refs = [_as_ref(i, i.get("name", "file")) for i in items]
+        hosted = [r for r in refs if r.get("url")]
+        no_host = len(refs) - len(hosted)
+        if hosted or no_host:
+            await _deliver_media(to_jid, account_id, hosted, no_host)
     elif ftype == "video":
-        await _deliver_media(to_jid, account_id, [{"name": "avatar.mp4", "kind": "video"}])
+        r = _as_ref(payload, "avatar.mp4")
+        if r.get("url"):
+            await _deliver_media(to_jid, account_id, [r], 0)
+        else:
+            await _deliver_media(to_jid, account_id, [], 1)
     # 'audio' (duplicate of embedded) and 'idle' frames are intentionally ignored.
 
 
-async def _deliver_media(to_jid: str, account_id: str, media: list):
-    """Deliver the bot's outbound files/audio/video into Zoom.
+def _as_ref(item: dict, default_name: str) -> dict:
+    """Normalize a media item to {name, url, expires_at}. The relay hands adapters a hosted
+    `url` (bytes stripped, TTL ~10 min); Zoom's chatbot can't push binary, so we forward the
+    link. If there's no url (relay didn't store it — e.g. KV unconfigured or oversized), the
+    item is undeliverable to Zoom and we surface that instead of pretending."""
+    return {"name": item.get("name", default_name), "url": item.get("url"),
+            "expires_at": item.get("expires_at")}
 
-    Zoom's chatbot API (imchat:bot) sends message CARDS only — it cannot push binary files,
-    so real delivery is link-based: upload the bytes to R2/KV (the relay-side normalization
-    layer, see docs/INTERFACE_BUS.md) and send the short-lived link as a `link` card here.
-    Until that layer exists we DON'T silently drop — we tell the user media was produced.
-    Wire the R2 link here (one call) once the normalization layer ships."""
-    names = ", ".join(m.get("name", "file") for m in media)
-    log.info("zoom_media_pending_r2", items=names, count=len(media))
-    await _send_zoom_reply(
-        to_jid, account_id,
-        f"📎 Generated {len(media)} attachment(s) ({names}). Zoom chat delivery needs the "
-        f"hosted-link layer — coming with R2.")
+
+async def _deliver_media(to_jid: str, account_id: str, refs: list, undeliverable: int = 0):
+    """Post the bot's outbound media into Zoom as short-lived links.
+
+    Zoom's chatbot API (imchat:bot) sends message CARDS only — it cannot push binary files —
+    so audio/video/files are delivered as the relay's hosted links (see docs/INTERFACE_BUS.md
+    §4.1). Zoom auto-links URLs in message text, so a plain line per file is enough."""
+    lines = []
+    for r in refs:
+        note = ""
+        exp = r.get("expires_at")
+        if exp:
+            secs = int(exp - time.time())
+            if secs > 0:
+                note = f" (link expires in ~{max(1, secs // 60)} min)"
+        lines.append(f"📎 {r['name']}: {r['url']}{note}")
+    if undeliverable:
+        lines.append(f"⚠️ {undeliverable} attachment(s) couldn't be hosted for a link "
+                     f"(relay file store unavailable).")
+    if lines:
+        log.info("zoom_media_delivered", links=len(refs), undeliverable=undeliverable)
+        await _send_zoom_reply(to_jid, account_id, "\n".join(lines))
 
 
 async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
