@@ -1,20 +1,31 @@
-# Zoom → RegisterABot thin adapter. Outbound-only (Zoom event WS + relay WS) — no ports.
-# Creds are injected from Infisical by the instar stack manager.
+# Zoom → RegisterABot thin adapter (multi-tenant interface).
+# - Self-fetches its OWN creds from Infisical at startup (service slug + service key + Zoom).
+# - Exposes a control plane on :8092 so the gatekeeper can POST /slugs/{bot}/connect on profile
+#   launch — that's how the bot slug (from the profile) reaches the adapter.
+# - Joins instar-internal (reachable by the gatekeeper) + instar-network (outbound to Zoom/relay).
 services:
-  zoom-registerabot:
+  api:
     build: .
     container_name: zoom-registerabot
-    restart: unless-stopped
     environment:
-      # Zoom Server-to-Server OAuth (receive events, send replies, fetch files)
-      - ZOOM_CLIENT_ID=${ZOOM_CLIENT_ID}
-      - ZOOM_CLIENT_SECRET=${ZOOM_CLIENT_SECRET}
-      - ZOOM_BOT_JID=${ZOOM_BOT_JID}
-      - ZOOM_WS_SUBSCRIPTION_ID=${ZOOM_WS_SUBSCRIPTION_ID:-}
-      - ZOOM_VERIFICATION_TOKEN=${ZOOM_VERIFICATION_TOKEN:-}
-      # RegisterABot relay. RELAY_URL is shared; service+bot slugs are ZOOM_-prefixed because
-      # they differ from the Slack adapter (service = who we speak as, bot = who we route to).
-      - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL}
-      - ZOOM_REGISTERABOT_SERVICE_SLUG=${ZOOM_REGISTERABOT_SERVICE_SLUG:-zoom-adapter}
-      - ZOOM_REGISTERABOT_TOKEN=${ZOOM_REGISTERABOT_TOKEN}
-      - ZOOM_REGISTERABOT_BOT_SLUG=${ZOOM_REGISTERABOT_BOT_SLUG}
+      - INFISICAL_URL=http://infisical:8080
+      - INFISICAL_TOKEN=${INFISICAL_TOKEN}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID}
+      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
+      - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL:-wss://relay.registerabot.com}
+      - CONTROL_PORT=8092
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - instar-internal
+      - instar-network
+
+networks:
+  instar-internal:
+    external: true
+  instar-network:
+    external: true

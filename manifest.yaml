@@ -1,27 +1,32 @@
 name: zoom_registerabot
 display_name: Zoom (via RegisterABot)
-description: Thin Zoom adapter — receives Zoom Team Chat messages + files over Zoom's outbound event WebSocket and pipes them to the bot over the RegisterABot relay as a service client. No gatekeeper contact.
+description: Thin multi-tenant Zoom adapter — receives Zoom Team Chat messages + files over Zoom's outbound event WebSocket and pipes them to a bot over the RegisterABot relay as a service client (using its OWN service key). The target bot slug comes from the profile that checks this interface. Outbound files/audio/video are delivered as the relay's short-lived hosted links (Zoom's chatbot API can't push binary). No gatekeeper contact for messages.
 type: interface
 category: Interfaces
 icon: zoom
-version: 0.1.0
+version: "0.2.0"
+tenancy: multi_tenant
+connection:
+  pattern: http
+  port: 8092
+  container_name: zoom-registerabot
 
+# The adapter's OWN identity + platform creds (self-fetched from Infisical). NOT the bot slug —
+# that is supplied per-profile via binding_fields below and delivered on /slugs/{bot}/connect.
 credentials:
-  - key: ZOOM_CLIENT_ID
-    description: Zoom Server-to-Server OAuth client id
-  - key: ZOOM_CLIENT_SECRET
-    description: Zoom Server-to-Server OAuth client secret
-  - key: ZOOM_BOT_JID
-    description: The Zoom chatbot JID (sender identity for replies; also filters our own echoes)
-  - key: ZOOM_WS_SUBSCRIPTION_ID
-    description: Zoom WebSocket subscription id (optional, if the app requires one)
-  - key: ZOOM_VERIFICATION_TOKEN
-    description: Zoom verification token — used to answer endpoint.url_validation challenges
-  - key: REGISTERABOT_RELAY_URL
-    description: RegisterABot relay base URL (wss://…)
-  - key: ZOOM_REGISTERABOT_TOKEN
-    description: This adapter's RegisterABot service API key (its relay identity)
-  - key: ZOOM_REGISTERABOT_BOT_SLUG
-    description: Which bot to route to on the relay (e.g. alex-cenora) — who we send TO
-  - key: ZOOM_REGISTERABOT_SERVICE_SLUG
-    description: This adapter's own service slug on the relay (who we speak AS; must match the service record the token belongs to; default zoom-adapter)
+  - ZOOM_CLIENT_ID
+  - ZOOM_CLIENT_SECRET
+  - ZOOM_BOT_JID
+  - ZOOM_WS_SUBSCRIPTION_ID
+  - ZOOM_VERIFICATION_TOKEN
+  - REGISTERABOT_RELAY_URL
+  - ZOOM_REGISTERABOT_SERVICE_SLUG
+  - ZOOM_REGISTERABOT_TOKEN
+
+# Per-profile binding: which bot this profile routes to (its registerabot slug). This is how
+# the profile hands the adapter its bot slug — the adapter never owns it.
+binding_fields:
+  - name: bot_slug
+    label: Bot Slug (registerabot)
+    type: text
+    required: true

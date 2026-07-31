@@ -1,26 +1,19 @@
-"""Zoom → RegisterABot adapter.
+"""Zoom → RegisterABot adapter (multi-tenant) — the Zoom twin of the Slack adapter.
 
-A THIN bridge, not a full connector — the Zoom twin of instar-interface-slack-registerabot.
-It receives Zoom Team Chat messages (and files) over Zoom's outbound WebSocket and forwards
-them to the bot over the RegisterABot relay as a *service client*, using this adapter's OWN
-relay identity (ZOOM_REGISTERABOT_TOKEN). It never talks to the instar gatekeeper/bot
-directly; the relay routes to the bot, and the bot-side registerabot connector extracts the
-attachments and runs the on_file barrier.
+Receives Zoom Team Chat messages (and files) over Zoom's outbound event WebSocket and forwards
+them to a bot over the RegisterABot relay as a *service client*.
 
-Two credential sets (both injected from Infisical by the stack):
-  - Zoom: ZOOM_CLIENT_ID + ZOOM_CLIENT_SECRET (Server-to-Server OAuth) — to open the event
-    WebSocket, send chat replies, and download dropped files (Zoom files sit behind an
-    authenticated download URL; only the Zoom token can fetch them). Plus ZOOM_BOT_JID and
-    ZOOM_WS_SUBSCRIPTION_ID for the chatbot + WS wiring.
-  - Relay: ZOOM_REGISTERABOT_TOKEN — this adapter's identity ON the relay.
+Two tokens, do not confuse them:
+  - This adapter's OWN service key (ZOOM_REGISTERABOT_TOKEN) — its identity as a SERVICE on the
+    relay, used to send service→bot. Lives in THIS adapter's Infisical.
+  - The bot's key lives in the PROFILE (its registerabot binding) — used by the instar
+    registerabot connector for the bot to connect as a BOT. None of this adapter's business.
 
-Protocol (registerabot SDK): connect wss://relay/ws/service/{serviceSlug}?key=…&bot=…,
-send {type:"chat_request", session_id, from:{kind:service}, to:{kind:bot}, payload:
-JSON({messages:[{role,content,attachments}], user_context})}, receive {type:"final_response",
-session_id, payload:JSON({reply})}. Correlate request↔reply by session_id.
+WHICH bot we route to comes from the profile: on launch the gatekeeper calls
+POST /slugs/{bot_slug}/connect (multi-tenant interface contract). There is no BOT_SLUG in config.
 
-Zoom's inbound *file* event schema was never implemented in the legacy connector, so
-_fetch_zoom_files is best-effort (documented) and must be validated against a real payload.
+Zoom's chatbot API (imchat:bot) sends CARDS only — it cannot push binary — so outbound
+files/audio/video are delivered as the relay's short-lived hosted links.
 """
 
 import asyncio
@@ -29,8 +22,10 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 import structlog
@@ -40,7 +35,7 @@ structlog.configure(processors=[structlog.processors.TimeStamper(fmt="iso"),
                                 structlog.dev.ConsoleRenderer()])
 log = structlog.get_logger()
 
-# --- creds / config (injected from Infisical by the stack) --------------------
+# --- creds / config (self-fetched from Infisical by entrypoint.sh) ------------
 ZOOM_CLIENT_ID = os.environ.get("ZOOM_CLIENT_ID", "")
 ZOOM_CLIENT_SECRET = os.environ.get("ZOOM_CLIENT_SECRET", "")
 ZOOM_BOT_JID = os.environ.get("ZOOM_BOT_JID", "")
@@ -49,26 +44,22 @@ ZOOM_VERIFICATION_TOKEN = os.environ.get("ZOOM_VERIFICATION_TOKEN", "")
 ZOOM_WS_URL = os.environ.get("ZOOM_WS_URL", "wss://ws.zoom.us/ws")
 
 RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://relay… (shared)
-# Service + bot slugs differ per adapter, so they're ZOOM_-prefixed (like the token) to avoid
-# colliding with the Slack adapter's values in a shared Infisical project. Generic fallbacks kept.
+# This adapter's OWN relay identity (a SERVICE). Its own slug + own key — NOT the profile's.
 SERVICE_SLUG = (os.environ.get("ZOOM_REGISTERABOT_SERVICE_SLUG")
-                or os.environ.get("REGISTERABOT_SERVICE_SLUG", "zoom-adapter"))  # who we speak AS
-SERVICE_KEY = os.environ.get("ZOOM_REGISTERABOT_TOKEN", "")            # that service's key
-BOT_SLUG = (os.environ.get("ZOOM_REGISTERABOT_BOT_SLUG")
-            or os.environ.get("REGISTERABOT_BOT_SLUG", ""))            # which bot we route TO
-REPLY_TIMEOUT = int(os.environ.get("REPLY_TIMEOUT", "300"))
+                or os.environ.get("REGISTERABOT_SERVICE_SLUG", "zoom-adapter"))
+SERVICE_KEY = os.environ.get("ZOOM_REGISTERABOT_TOKEN", "")            # our service key
+CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8092"))
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))
 
 TOKEN_URL = "https://zoom.us/oauth/token"
 CHATBOT_API = "https://api.zoom.us/v2/im/chat/messages"
 
-# --- relay websocket state (one persistent service connection) ----------------
+# --- relay + routing state ----------------------------------------------------
 _relay_ws = None
 _relay_loop: asyncio.AbstractEventLoop | None = None
-# session_id -> {"to_jid", "account_id", "ts"} — where to post this turn's frames.
-# The relay routes EVERY bot→service frame (final_response, video, …) by session_id, so we
-# keep the reply destination around long enough to catch trailing frames.
+_active_bot: str | None = None            # which bot we route TO — comes from the profile
+# session_id -> {"to_jid", "account_id", "ts"}
 _sessions: dict[str, dict] = {}
-SESSION_TTL = int(os.environ.get("SESSION_TTL", "600"))
 
 # --- Zoom S2S token cache -----------------------------------------------------
 _zoom_token: str | None = None
@@ -76,8 +67,7 @@ _zoom_token_exp: float = 0.0
 
 
 async def _get_zoom_token() -> str | None:
-    """Server-to-Server client-credentials token, cached with a 60s expiry buffer.
-    Used for the event WS, sending replies, and downloading files."""
+    """Server-to-Server client-credentials token, cached with a 60s expiry buffer."""
     global _zoom_token, _zoom_token_exp
     if _zoom_token and time.time() < _zoom_token_exp - 60:
         return _zoom_token
@@ -97,17 +87,30 @@ async def _get_zoom_token() -> str | None:
     return None
 
 
-# --- relay client (identical shape to the Slack adapter) ----------------------
+def _prune_sessions():
+    cutoff = time.time() - SESSION_TTL
+    for sid in [s for s, v in _sessions.items() if v.get("ts", 0) < cutoff]:
+        _sessions.pop(sid, None)
+
+
+# --- relay client -------------------------------------------------------------
 async def _relay_client():
-    """Maintain one persistent service-client WS to the relay; resolve replies by session_id."""
+    """Service-client WS to the relay for whichever bot the profile connected us to. We auth
+    with OUR OWN service slug + key; the bot slug is the profile's. Reconnects on bot change."""
     global _relay_ws
-    url = f"{RELAY_URL}/ws/service/{SERVICE_SLUG}?key={SERVICE_KEY}&bot={BOT_SLUG}"
     while True:
+        bot = _active_bot
+        if not bot:
+            await asyncio.sleep(1)
+            continue
+        url = f"{RELAY_URL}/ws/service/{SERVICE_SLUG}?key={SERVICE_KEY}&bot={bot}"
         try:
             async with websockets.connect(url, max_size=None) as ws:
                 _relay_ws = ws
-                log.info("relay_connected", service=SERVICE_SLUG, bot=BOT_SLUG)
+                log.info("relay_connected", service=SERVICE_SLUG, bot=bot)
                 async for raw in ws:
+                    if _active_bot != bot:
+                        break
                     try:
                         env = json.loads(raw)
                     except json.JSONDecodeError:
@@ -121,13 +124,30 @@ async def _relay_client():
             log.warning("relay_disconnected", error=str(e))
         finally:
             _relay_ws = None
-        await asyncio.sleep(5)  # reconnect
+        await asyncio.sleep(2)
 
 
-def _prune_sessions():
-    cutoff = time.time() - SESSION_TTL
-    for sid in [s for s, v in _sessions.items() if v.get("ts", 0) < cutoff]:
-        _sessions.pop(sid, None)
+async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
+    """Send one chat_request over the relay to the currently-connected bot."""
+    if _relay_ws is None or not _active_bot:
+        return
+    envelope = {
+        "v": 1, "type": "chat_request", "session_id": sid,
+        "timestamp": int(time.time() * 1000),
+        "from": {"kind": "service", "slug": SERVICE_SLUG, "name": "Zoom"},
+        "to": {"kind": "bot", "slug": _active_bot},
+        "encrypted": False,
+        # Attachments go ON THE MESSAGE — the bot-side registerabot connector reads
+        # m.get('attachments') per message and forwards them to /process (on_file barrier).
+        "payload": json.dumps({
+            "messages": [{"role": "user", "content": text, "attachments": attachments}],
+            "user_context": {"user_id": user_id},
+        }),
+    }
+    try:
+        await _relay_ws.send(json.dumps(envelope))
+    except Exception as e:
+        log.warning("send_to_bot_failed", error=str(e))
 
 
 async def _dispatch_frame(env: dict):
@@ -146,7 +166,6 @@ async def _dispatch_frame(env: dict):
         reply = payload.get("reply") or ""
         if reply:
             await _send_zoom_reply(to_jid, account_id, reply)
-        # Outbound files + embedded voice audio → hosted links (the relay stored them).
         items = [a for a in (payload.get("attachments") or []) if a.get("type") != "audio"]
         if payload.get("audio"):
             items.append({**payload["audio"], "name": "voice.mp3"})
@@ -166,19 +185,13 @@ async def _dispatch_frame(env: dict):
 
 def _as_ref(item: dict, default_name: str) -> dict:
     """Normalize a media item to {name, url, expires_at}. The relay hands adapters a hosted
-    `url` (bytes stripped, TTL ~10 min); Zoom's chatbot can't push binary, so we forward the
-    link. If there's no url (relay didn't store it — e.g. KV unconfigured or oversized), the
-    item is undeliverable to Zoom and we surface that instead of pretending."""
+    `url` (bytes stripped, TTL ~10 min); Zoom's chatbot can't push binary, so we forward it."""
     return {"name": item.get("name", default_name), "url": item.get("url"),
             "expires_at": item.get("expires_at")}
 
 
 async def _deliver_media(to_jid: str, account_id: str, refs: list, undeliverable: int = 0):
-    """Post the bot's outbound media into Zoom as short-lived links.
-
-    Zoom's chatbot API (imchat:bot) sends message CARDS only — it cannot push binary files —
-    so audio/video/files are delivered as the relay's hosted links (see docs/INTERFACE_BUS.md
-    §4.1). Zoom auto-links URLs in message text, so a plain line per file is enough."""
+    """Post the bot's outbound media into Zoom as short-lived links (Zoom auto-links URLs)."""
     lines = []
     for r in refs:
         note = ""
@@ -196,41 +209,11 @@ async def _deliver_media(to_jid: str, account_id: str, refs: list, undeliverable
         await _send_zoom_reply(to_jid, account_id, "\n".join(lines))
 
 
-async def _send_to_bot(sid: str, text: str, user_id: str, attachments: list):
-    """Send one chat_request over the relay. Replies arrive asynchronously as frames."""
-    if _relay_ws is None:
-        return
-    envelope = {
-        "v": 1, "type": "chat_request", "session_id": sid,
-        "timestamp": int(time.time() * 1000),
-        "from": {"kind": "service", "slug": SERVICE_SLUG, "name": "Zoom"},
-        "to": {"kind": "bot", "slug": BOT_SLUG},
-        "encrypted": False,
-        # Attachments go ON THE MESSAGE — the bot-side registerabot connector reads
-        # m.get('attachments') per message and forwards them to /process, which feeds
-        # the on_file barrier. (Top-level payload attachments would be missed.)
-        "payload": json.dumps({
-            "messages": [{"role": "user", "content": text, "attachments": attachments}],
-            "user_context": {"user_id": user_id},
-        }),
-    }
-    try:
-        await _relay_ws.send(json.dumps(envelope))
-    except Exception as e:
-        log.warning("send_to_bot_failed", error=str(e))
-
-
-# --- Zoom file fetch (best-effort — validate against a real payload) ----------
+# --- Zoom file fetch (best-effort inbound — validate against a real payload) ---
 async def _fetch_zoom_files(obj: dict) -> list:
-    """Download files dropped in a Zoom Team Chat message → attachment dicts
-    {name, mime, encoding:base64, data}.
-
-    NOTE: the legacy Zoom connector never handled inbound files, so Zoom's exact
-    inbound file schema is UNCONFIRMED. This handles the documented shape where the
-    message object carries `files: [{name/file_name, download_url, ...}]` (same shape
-    as recording files, which download via the Zoom bearer token). If a deployment
-    surfaces `file_ids` only (no download_url), wire the Zoom file-download API here
-    after inspecting one real payload — logged loudly so it isn't silently dropped."""
+    """Download files dropped in a Zoom Team Chat message → attachment dicts. Zoom's inbound
+    file schema was never in the legacy connector, so this handles the documented
+    `files:[{download_url}]` shape and loudly logs a `file_ids`-only payload."""
     files = obj.get("files") or obj.get("file") or []
     if isinstance(files, dict):
         files = [files]
@@ -262,7 +245,7 @@ async def _fetch_zoom_files(obj: dict) -> list:
 
 # --- Zoom reply ----------------------------------------------------------------
 async def _send_zoom_reply(to_jid: str, account_id: str, text: str):
-    """Post the bot's reply back into the Zoom conversation via the chatbot API."""
+    """Post a message back into the Zoom conversation via the chatbot API."""
     token = await _get_zoom_token()
     if not token:
         log.warning("zoom_reply_no_token")
@@ -295,7 +278,6 @@ async def _handle_event(raw: str, ws):
     payload = data.get("payload", {}) or {}
 
     if event == "endpoint.url_validation":
-        # Zoom challenge — echo the hashed plainToken to prove ownership.
         plain = payload.get("plainToken", "")
         if plain and ZOOM_VERIFICATION_TOKEN:
             enc = hmac.new(ZOOM_VERIFICATION_TOKEN.encode(), plain.encode(),
@@ -309,7 +291,7 @@ async def _handle_event(raw: str, ws):
 
     obj = payload.get("object", {}) or {}
     sender = obj.get("sender", "")
-    if sender == ZOOM_BOT_JID:   # ignore our own echoes
+    if sender == ZOOM_BOT_JID:
         return
     text = (obj.get("message") or "").strip()
     to_jid = obj.get("to_jid") or obj.get("channel_id") or ""
@@ -320,12 +302,10 @@ async def _handle_event(raw: str, ws):
     if not text and not attachments:
         return
 
-    if _relay_ws is None:
-        await _send_zoom_reply(to_jid, account_id,
-                               "I couldn't reach the bot right now — try again in a moment.")
+    if _relay_ws is None or not _active_bot:
+        await _send_zoom_reply(to_jid, account_id, "No bot is connected to this Zoom app yet.")
         return
 
-    # Register where this turn's frames should land, then fire the request (non-blocking).
     sid = str(uuid.uuid4())
     _prune_sessions()
     _sessions[sid] = {"to_jid": to_jid, "account_id": account_id, "ts": time.time()}
@@ -354,7 +334,7 @@ async def _zoom_client():
                     hb.cancel()
         except Exception as e:
             log.warning("zoom_ws_disconnected", error=str(e))
-        await asyncio.sleep(5)  # reconnect
+        await asyncio.sleep(5)
 
 
 async def _heartbeat(ws):
@@ -368,18 +348,74 @@ async def _heartbeat(ws):
         log.warning("zoom_heartbeat_error", error=str(e))
 
 
+# --- multi-tenant control plane (instar connects/disconnects us per profile) --
+def _set_active_bot(bot: str | None):
+    """Point (or unpoint) the adapter at a bot slug (from the profile) and force the relay to
+    reconnect. Our service identity never changes — only which bot we route to."""
+    global _active_bot
+    _active_bot = bot
+    if _relay_loop and _relay_ws is not None:
+        asyncio.run_coroutine_threadsafe(_relay_ws.close(), _relay_loop)
+
+
+class _Control(BaseHTTPRequestHandler):
+    def _reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/health", "/status"):
+            return self._reply(200, {"status": "ok", "service": SERVICE_SLUG,
+                                     "active_bot": _active_bot})
+        self._reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        # The profile hands us ONLY its bot slug (in the path); its own token is the bot's, not
+        # ours, so we ignore any body.
+        parts = [p for p in self.path.split("/") if p]  # ['slugs', '{bot}', 'connect']
+        if len(parts) == 3 and parts[0] == "slugs":
+            bot, action = parts[1], parts[2]
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+            except Exception:
+                pass
+            if action == "connect":
+                _set_active_bot(bot)
+                log.info("profile_connected", bot=bot, service=SERVICE_SLUG)
+                return self._reply(200, {"status": "connected", "bot": bot, "service": SERVICE_SLUG})
+            if action == "disconnect":
+                if _active_bot == bot:
+                    _set_active_bot(None)
+                log.info("profile_disconnected", bot=bot)
+                return self._reply(200, {"status": "disconnected", "bot": bot})
+        self._reply(404, {"error": "not found"})
+
+    def log_message(self, *a):
+        pass
+
+
+def _start_control_server():
+    HTTPServer(("0.0.0.0", CONTROL_PORT), _Control).serve_forever()
+
+
 async def main():
     global _relay_loop
     missing = [k for k, v in {
         "ZOOM_CLIENT_ID": ZOOM_CLIENT_ID, "ZOOM_CLIENT_SECRET": ZOOM_CLIENT_SECRET,
         "ZOOM_BOT_JID": ZOOM_BOT_JID, "REGISTERABOT_RELAY_URL": RELAY_URL,
-        "ZOOM_REGISTERABOT_TOKEN": SERVICE_KEY, "REGISTERABOT_BOT_SLUG": BOT_SLUG,
+        "ZOOM_REGISTERABOT_TOKEN": SERVICE_KEY,
     }.items() if not v]
     if missing:
         raise SystemExit(f"Missing required env: {missing}")
 
     _relay_loop = asyncio.get_running_loop()
-    log.info("zoom_registerabot_adapter_starting", service=SERVICE_SLUG, bot=BOT_SLUG)
+    threading.Thread(target=_start_control_server, daemon=True).start()
+    log.info("zoom_registerabot_adapter_starting", service=SERVICE_SLUG, control_port=CONTROL_PORT)
     await asyncio.gather(_relay_client(), _zoom_client())
 
 
