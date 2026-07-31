@@ -48,10 +48,14 @@ ZOOM_WS_SUBSCRIPTION_ID = os.environ.get("ZOOM_WS_SUBSCRIPTION_ID", "")
 ZOOM_VERIFICATION_TOKEN = os.environ.get("ZOOM_VERIFICATION_TOKEN", "")
 ZOOM_WS_URL = os.environ.get("ZOOM_WS_URL", "wss://ws.zoom.us/ws")
 
-RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://relay…
-SERVICE_SLUG = os.environ.get("REGISTERABOT_SERVICE_SLUG", "zoom-adapter")
-SERVICE_KEY = os.environ.get("ZOOM_REGISTERABOT_TOKEN", "")            # relay identity
-BOT_SLUG = os.environ.get("REGISTERABOT_BOT_SLUG", "")
+RELAY_URL = os.environ.get("REGISTERABOT_RELAY_URL", "").rstrip("/")   # wss://relay… (shared)
+# Service + bot slugs differ per adapter, so they're ZOOM_-prefixed (like the token) to avoid
+# colliding with the Slack adapter's values in a shared Infisical project. Generic fallbacks kept.
+SERVICE_SLUG = (os.environ.get("ZOOM_REGISTERABOT_SERVICE_SLUG")
+                or os.environ.get("REGISTERABOT_SERVICE_SLUG", "zoom-adapter"))  # who we speak AS
+SERVICE_KEY = os.environ.get("ZOOM_REGISTERABOT_TOKEN", "")            # that service's key
+BOT_SLUG = (os.environ.get("ZOOM_REGISTERABOT_BOT_SLUG")
+            or os.environ.get("REGISTERABOT_BOT_SLUG", ""))            # which bot we route TO
 REPLY_TIMEOUT = int(os.environ.get("REPLY_TIMEOUT", "300"))
 
 TOKEN_URL = "https://zoom.us/oauth/token"

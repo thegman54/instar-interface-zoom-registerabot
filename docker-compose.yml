@@ -12,8 +12,9 @@ services:
       - ZOOM_BOT_JID=${ZOOM_BOT_JID}
       - ZOOM_WS_SUBSCRIPTION_ID=${ZOOM_WS_SUBSCRIPTION_ID:-}
       - ZOOM_VERIFICATION_TOKEN=${ZOOM_VERIFICATION_TOKEN:-}
-      # RegisterABot relay (this adapter's own identity)
+      # RegisterABot relay. RELAY_URL is shared; service+bot slugs are ZOOM_-prefixed because
+      # they differ from the Slack adapter (service = who we speak as, bot = who we route to).
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL}
-      - REGISTERABOT_SERVICE_SLUG=${REGISTERABOT_SERVICE_SLUG:-zoom-adapter}
+      - ZOOM_REGISTERABOT_SERVICE_SLUG=${ZOOM_REGISTERABOT_SERVICE_SLUG:-zoom-adapter}
       - ZOOM_REGISTERABOT_TOKEN=${ZOOM_REGISTERABOT_TOKEN}
-      - REGISTERABOT_BOT_SLUG=${REGISTERABOT_BOT_SLUG}
+      - ZOOM_REGISTERABOT_BOT_SLUG=${ZOOM_REGISTERABOT_BOT_SLUG}
