@@ -225,8 +225,11 @@ async def _send_zoom_reply(to_jid: str, account_id: str, text: str):
                              headers={"Authorization": f"Bearer {token}",
                                       "Content-Type": "application/json"},
                              json=payload, timeout=15)
-        if r.status_code != 200:
+        # Zoom's chatbot API returns 201 Created on success (not 200).
+        if r.status_code not in (200, 201):
             log.warning("zoom_reply_failed", status=r.status_code, body=r.text[:200])
+        else:
+            log.info("zoom_reply_sent", status=r.status_code)
     except Exception as e:
         log.warning("zoom_reply_error", error=str(e))
 
