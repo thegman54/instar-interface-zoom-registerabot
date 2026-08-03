@@ -39,7 +39,10 @@ log = structlog.get_logger()
 ZOOM_CLIENT_ID = os.environ.get("ZOOM_CLIENT_ID", "")
 ZOOM_CLIENT_SECRET = os.environ.get("ZOOM_CLIENT_SECRET", "")
 ZOOM_BOT_JID = os.environ.get("ZOOM_BOT_JID", "")
-ZOOM_WS_SUBSCRIPTION_ID = os.environ.get("ZOOM_WS_SUBSCRIPTION_ID", "")
+# Accept either name — Infisical may hold it as ZOOM_SUBSCRIPTION_ID (Zoom's own label) or the
+# WS-prefixed name. Required for Zoom's event WebSocket; without it the WS endpoint 404s.
+ZOOM_WS_SUBSCRIPTION_ID = (os.environ.get("ZOOM_WS_SUBSCRIPTION_ID")
+                           or os.environ.get("ZOOM_SUBSCRIPTION_ID", ""))
 ZOOM_VERIFICATION_TOKEN = os.environ.get("ZOOM_VERIFICATION_TOKEN", "")
 ZOOM_WS_URL = os.environ.get("ZOOM_WS_URL", "wss://ws.zoom.us/ws")
 

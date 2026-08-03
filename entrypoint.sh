@@ -7,7 +7,7 @@ if [ -n "$INFISICAL_URL" ] && [ -n "$INFISICAL_TOKEN" ] && [ -n "$INFISICAL_PROJ
     echo "Fetching secrets from Infisical..."
     python3 /app/fetch_secrets.py \
         ZOOM_CLIENT_ID ZOOM_CLIENT_SECRET ZOOM_BOT_JID \
-        ZOOM_WS_SUBSCRIPTION_ID ZOOM_VERIFICATION_TOKEN \
+        ZOOM_WS_SUBSCRIPTION_ID ZOOM_SUBSCRIPTION_ID ZOOM_VERIFICATION_TOKEN \
         REGISTERABOT_RELAY_URL ZOOM_REGISTERABOT_SERVICE_SLUG ZOOM_REGISTERABOT_TOKEN \
         > /tmp/.secrets 2>/tmp/.secrets_err
 
