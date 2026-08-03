@@ -1,8 +1,11 @@
 # Zoom → RegisterABot thin adapter (multi-tenant interface).
 # - Self-fetches its OWN creds from Infisical at startup (service slug + service key + Zoom).
-# - Exposes a control plane on :8092 so the gatekeeper can POST /slugs/{bot}/connect on profile
-#   launch — that's how the bot slug (from the profile) reaches the adapter.
-# - Joins instar-internal (reachable by the gatekeeper) + instar-network (outbound to Zoom/relay).
+# - Control plane :8092 — the gatekeeper POSTs /slugs/{bot}/connect on profile launch (internal).
+# - Webhook :8087 — Zoom's Bot Endpoint. Zoom chatbots deliver user messages to a webhook (not a
+#   WebSocket), so point a Cloudflare Tunnel at zoom-registerabot:8087 and set the Zoom app's Bot
+#   Endpoint URL to <tunnel-host>/webhook (same pattern as the old zoom connector's zoom-api:8087).
+# - Joins instar-internal (gatekeeper reach) + instar-network (outbound to Zoom/relay; the tunnel
+#   sidecar reaches :8087 over the shared network).
 services:
   api:
     build: .
@@ -14,6 +17,7 @@ services:
       - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
       - REGISTERABOT_RELAY_URL=${REGISTERABOT_RELAY_URL:-wss://relay.registerabot.com}
       - CONTROL_PORT=8092
+      - WEBHOOK_PORT=8087
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
       interval: 30s
