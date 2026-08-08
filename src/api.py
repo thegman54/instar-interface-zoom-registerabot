@@ -25,7 +25,6 @@ import json
 import os
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
@@ -249,7 +248,10 @@ def _handle_bot_notification(payload: dict):
                 _send_zoom_reply(to_jid, account_id, "No bot is connected to this Zoom app yet."),
                 _relay_loop)
         return
-    sid = str(uuid.uuid4())
+    # STABLE key, not a per-message uuid. session_id becomes the gatekeeper's conversation_id,
+    # so a fresh uuid each turn threw away context and burned a bot session per message.
+    # One rolling conversation per Zoom peer (the user↔bot chat).
+    sid = f"zoom-{account_id}-{to_jid or user_id}"
     _prune_sessions()
     _sessions[sid] = {"to_jid": to_jid, "account_id": account_id, "ts": time.time()}
     log.info("zoom_message", user=payload.get("userName"), bot=_active_bot)
