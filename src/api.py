@@ -172,7 +172,12 @@ async def _dispatch_frame(env: dict):
         if hosted or no_host:
             await _deliver_media(to_jid, account_id, hosted, no_host)
     elif ftype == "video":
-        r = _as_ref(payload, "avatar.mp4")
+        # A turn may arrive as several clips (payload carries seq/final — see the chunked
+        # renderer). Zoom can't stitch them, so number them rather than delivering a run of
+        # files all called "avatar.mp4" with no play order.
+        _seq = payload.get("seq")
+        _chunked = _seq is not None and not (_seq == 0 and payload.get("final", True))
+        r = _as_ref(payload, f"avatar-{int(_seq) + 1}.mp4" if _chunked else "avatar.mp4")
         if r.get("url"):
             await _deliver_media(to_jid, account_id, [r], 0)
         else:
